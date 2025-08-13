@@ -1,200 +1,383 @@
 #!/bin/bash
 
+# source >> https://github.com/taufikmrf/ScrCpy-Launcher/blob/main/scrcpy.sh
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/scrcpy_config.conf"
+LANG_DIR="$SCRIPT_DIR/language"
 
-CTRLC_COUNT=0
-SCRCPY_PID=""
+LANG_SETTING="auto"
+PORT=5555
+BITRATE="8M"
+RESOLUTION=1024
 
-if [[ -f "$CONFIG_FILE" ]]; then
+USB_DEVICES=()
+SELECTED_USB_DEVICE=""
+EXIT_REQUESTED=0
+SCRCPY_PID=0
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
-else
-    PORT=5555
-    BITRATE="8M"
-    RESOLUTION="1024"
-    echo "PORT=$PORT" > "$CONFIG_FILE"
-    echo "BITRATE=$BITRATE" >> "$CONFIG_FILE"
-    echo "RESOLUTION=$RESOLUTION" >> "$CONFIG_FILE"
-fi
+  else
+    save_config
+  fi
+}
 
 save_config() {
-    echo "PORT=$PORT" > "$CONFIG_FILE"
-    echo "BITRATE=$BITRATE" >> "$CONFIG_FILE"
-    echo "RESOLUTION=$RESOLUTION" >> "$CONFIG_FILE"
+  cat > "$CONFIG_FILE" << EOF
+LANG_SETTING=$LANG_SETTING
+PORT=$PORT
+BITRATE=$BITRATE
+RESOLUTION=$RESOLUTION
+EOF
 }
 
-handle_interrupt() {
-    ((CTRLC_COUNT++))
-    if [[ $CTRLC_COUNT -eq 1 ]]; then
-        echo -e "\n⚠️  Ctrl+C terdeteksi. Menutup scrcpy..."
-        if [[ -n "$SCRCPY_PID" ]]; then
-            kill "$SCRCPY_PID" 2>/dev/null
-            sleep 0.3
-            if ps -p "$SCRCPY_PID" > /dev/null 2>&1; then
-                kill -9 "$SCRCPY_PID" 2>/dev/null
-            fi
-            SCRCPY_PID=""
-        fi
-        CTRLC_COUNT=0
-        clear
-        main_menu
+detect_lang() {
+  if [[ -n "$LANG" ]]; then
+    echo "${LANG:0:2}"
+  else
+    echo "en"
+  fi
+}
+
+load_language_file() {
+  local lang_file="$LANG_DIR/$1.lang"
+  if [[ -f "$lang_file" ]]; then
+    # shellcheck source=/dev/null
+    source "$lang_file"
+  else
+    echo "Language file $lang_file not found!"
+    exit 1
+  fi
+}
+
+set_language() {
+  local lang="$1"
+  if [[ "$lang" == "auto" ]]; then
+    lang=$(detect_lang)
+  fi
+
+  case "$lang" in
+    id|en)
+      LANG_SETTING="$lang"
+      save_config
+      load_language_file "$lang"
+      ;;
+    *)
+      LANG_SETTING="en"
+      save_config
+      load_language_file "en"
+      ;;
+  esac
+}
+
+handle_ctrl_c() {
+  if (( SCRCPY_PID != 0 )); then
+    echo
+    echo "$TXT_CTRL_C_DETECTED"
+    kill "$SCRCPY_PID" 2>/dev/null
+    wait "$SCRCPY_PID" 2>/dev/null
+    SCRCPY_PID=0
+    EXIT_REQUESTED=0
+    read -rp "$TXT_PRESS_ENTER"
+    clear
+  else
+    if (( EXIT_REQUESTED == 0 )); then
+      EXIT_REQUESTED=1
+      echo
+      echo "$TXT_CTRL_C_DETECTED"
+      echo "$TXT_CTRL_C_EXIT_NOTICE"
     else
-        echo -e "\n🚪 Keluar skrip..."
-        read -p "Tekan Enter untuk keluar..."
-        clear
-        exit 0
+      echo
+      echo "$TXT_EXIT_MSG"
+      read -r
+      clear
+      exit 0
     fi
+  fi
 }
 
-trap handle_interrupt SIGINT
-
-run_scrcpy() {
-    mode=$1
-    if [[ "$mode" == "usb" ]]; then
-        echo "🔌 Menjalankan scrcpy via USB..."
-        scrcpy --power-off-on-close -Sw -d --video-bit-rate "$BITRATE" --max-size "$RESOLUTION" >/dev/null 2>&1 &
-    else
-        echo "📡 Menjalankan scrcpy via Wi-Fi ($IP:$PORT)..."
-        scrcpy --power-off-on-close -Sw -e --video-bit-rate "$BITRATE" --max-size "$RESOLUTION" >/dev/null 2>&1 &
-    fi
-    SCRCPY_PID=$!
-    wait $SCRCPY_PID 2>/dev/null
-}
+trap 'handle_ctrl_c' SIGINT
 
 check_usb_devices() {
-    adb devices | grep -w "device" | grep -v "List" | awk '{print $1}'
+  USB_DEVICES=()
+  while IFS= read -r line; do
+    # Filter hanya device USB, bukan IP Wi-Fi
+    if [[ ! "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?$ ]]; then
+      USB_DEVICES+=("$line")
+    fi
+  done < <(adb devices | grep -v "List of devices" | grep -w "device" | cut -f1)
 }
 
-auto_connect_usb() {
-    devices=($(check_usb_devices))
-    if [[ ${#devices[@]} -gt 0 ]]; then
-        if [[ ${#devices[@]} -eq 1 ]]; then
-            echo "🔍 USB device terdeteksi: ${devices[0]}"
-            run_scrcpy "usb"
-        else
-            echo "🔍 Ditemukan beberapa USB device:"
-            select dev in "${devices[@]}"; do
-                adb -s "$dev" usb
-                run_scrcpy "usb"
-                break
-            done
-        fi
-        return 0
-    fi
-    return 1
+run_scrcpy_usb() {
+  echo "${TXT_RUNNING_USB}${SELECTED_USB_DEVICE}..."
+  scrcpy --power-off-on-close -Sw -d --video-bit-rate "$BITRATE" --max-size "$RESOLUTION" &
+  SCRCPY_PID=$!
+  wait "$SCRCPY_PID"
+  SCRCPY_PID=0
+}
+
+run_scrcpy_wifi() {
+  local ip="$1"
+  echo "${TXT_CONNECTING_WIFI}${ip}:${PORT}..."
+  if adb connect "$ip:$PORT" | grep -iq "connected to"; then
+    echo "${TXT_RUNNING_WIFI}${ip}:${PORT}..."
+    scrcpy --power-off-on-close -Sw -e --video-bit-rate "$BITRATE" --max-size "$RESOLUTION" &
+    SCRCPY_PID=$!
+    wait "$SCRCPY_PID"
+    SCRCPY_PID=0
+  else
+    echo "${TXT_FAILED_CONNECT_IP}${ip}:$PORT"
+    read -rp "$TXT_PRESS_ENTER"
+  fi
+}
+
+run_manual_wifi() {
+  local local_ip
+  local_ip=$(ipconfig getifaddr en0)
+  if [[ -z "$local_ip" ]]; then
+    echo "$TXT_IP_LOCAL_FAILED"
+    read -rp "$TXT_PRESS_ENTER"
+    return
+  fi
+
+  local ip_prefix
+  ip_prefix=$(echo "$local_ip" | awk -F. '{print $1"."$2"."$3"."}')
+
+  read -rp "${TXT_ENTER_IP}${ip_prefix}" last_segment
+
+  if [[ ! "$last_segment" =~ ^([0-9]{1,3})$ ]] || (( last_segment < 0 || last_segment > 255 )); then
+    echo "$TXT_SEGMENT_IP_INVALID"
+    read -rp "$TXT_PRESS_ENTER"
+    return
+  fi
+
+  local full_ip="${ip_prefix}${last_segment}"
+  run_scrcpy_wifi "$full_ip"
 }
 
 auto_detect_wifi() {
-    wifi_devices=($(adb devices | grep -E '([0-9]{1,3}\.){3}[0-9]{1,3}:' | awk '{print $1}'))
+  echo "$TXT_AUTO_WIFI_START"
 
-    if [[ ${#wifi_devices[@]} -gt 0 ]]; then
-        IP="${wifi_devices[0]}"
-        echo "📡 Perangkat Wi-Fi ditemukan: $IP"
-        run_scrcpy "wifi"
-        return
+  wifi_devices=()
+  while IFS= read -r line; do
+    ipdev=$(echo "$line" | cut -f1)
+    if [[ "$ipdev" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?$ ]]; then
+      wifi_devices+=("$ipdev")
     fi
+  done < <(adb devices | grep -w "device" | tail -n +2)
 
-    usb_devices=($(check_usb_devices))
-    if [[ ${#usb_devices[@]} -gt 0 ]]; then
-        echo "🔌 Mengaktifkan mode TCP/IP pada device USB ${usb_devices[0]}..."
-        adb tcpip "$PORT"
-        sleep 1
-        echo "📴 Lepaskan USB dan pastikan HP terhubung ke Wi-Fi yang sama."
-    fi
+  if [ ${#wifi_devices[@]} -gt 0 ]; then
+    run_scrcpy_wifi "${wifi_devices[0]%%:*}"
+    return
+  fi
 
-    subnet=""
-    if command -v networksetup &>/dev/null; then
-        iface=$(networksetup -listallhardwareports | awk '/Wi-Fi/{getline; print $2}')
-        subnet=$(ifconfig "$iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | sed 's/\.[0-9]*$/\.0\/24/')
-    fi
-    if [[ -z "$subnet" ]]; then
-        iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $5}')
-        subnet=$(ip -o -f inet addr show "$iface" 2>/dev/null | awk '{print $4}')
-    fi
+  check_usb_devices
+  if [ ${#USB_DEVICES[@]} -gt 0 ]; then
+    echo "${TXT_USB_ACTIVATE_TCPIP}${USB_DEVICES[0]}..."
+    adb tcpip "$PORT"
+    sleep 2
+    echo "$TXT_USB_RELEASE_USB"
+  else
+    echo "$TXT_USB_NO_DEVICE"
+    read -rp "$TXT_PRESS_ENTER"
+    return
+  fi
 
-    if [[ -z "$subnet" ]]; then
-        echo "❌ Gagal mendeteksi subnet Wi-Fi."
-        read -p "Tekan Enter untuk kembali ke menu..."
-        return 1
-    fi
+  local_ip=$(ipconfig getifaddr en0)
+  if [[ -z "$local_ip" ]]; then
+    echo "$TXT_IP_LOCAL_FAILED"
+    read -rp "$TXT_PRESS_ENTER"
+    return
+  fi
 
-    echo "🌐 Memindai jaringan $subnet untuk port $PORT..."
-    hosts=($(nmap -p "$PORT" --open -T4 "$subnet" -oG - | grep "/open" | awk '{print $2}'))
+  subnet=$(echo "$local_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
 
-    if [[ ${#hosts[@]} -eq 0 ]]; then
-        echo "❌ Tidak ditemukan perangkat Wi-Fi dengan port $PORT terbuka."
-        read -p "Tekan Enter untuk kembali ke menu..."
-        return 1
-    elif [[ ${#hosts[@]} -eq 1 ]]; then
-        IP="${hosts[0]}"
-        echo "📱 Menghubungkan ke $IP..."
-        adb connect "$IP:$PORT"
-        run_scrcpy "wifi"
-    else
-        echo "📡 Ditemukan beberapa perangkat Wi-Fi:"
-        select ip in "${hosts[@]}"; do
-            if [[ -n "$ip" ]]; then
-                IP="$ip"
-                adb connect "$IP:$PORT"
-                run_scrcpy "wifi"
-                break
-            fi
-        done
-    fi
+  echo "${TXT_SCAN_NETWORK}${subnet}..."
+
+  if ! command -v nmap &> /dev/null; then
+    echo "$TXT_NMAP_NOT_FOUND"
+    read -rp "$TXT_PRESS_ENTER"
+    return
+  fi
+
+  mapfile -t open_ips < <(nmap -p "$PORT" --open -T4 "$subnet" -oG - | grep "Ports: $PORT/open" | awk '{print $2}')
+
+  if [ ${#open_ips[@]} -eq 0 ]; then
+    echo "${TXT_NOT_FOUND_WIFI}${PORT}."
+    read -rp "$TXT_PRESS_ENTER"
+    return
+  fi
+
+  if [ ${#open_ips[@]} -eq 1 ]; then
+    run_scrcpy_wifi "${open_ips[0]}"
+    return
+  fi
+
+  echo "$TXT_CHOOSE_WIFI"
+  for i in "${!open_ips[@]}"; do
+    echo "[$((i+1))] ${open_ips[i]}"
+  done
+
+  read -rp "$TXT_CHOOSE_WIFI_SELECT" sel
+  if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#open_ips[@]} )); then
+    run_scrcpy_wifi "${open_ips[$((sel-1))]}"
+  else
+    echo "$TXT_INVALID_CHOICE"
+    sleep 1
+  fi
+}
+
+change_port() {
+  read -rp "$TXT_ENTER_PORT" newPort
+  if [[ "$newPort" =~ ^[0-9]+$ ]]; then
+    PORT="$newPort"
+    save_config
+  else
+    echo "$TXT_INVALID_CHOICE"
+    sleep 1
+  fi
+}
+
+change_bitrate() {
+  read -rp "$TXT_ENTER_BITRATE" newBitrate
+  if [[ -n "$newBitrate" ]]; then
+    BITRATE="$newBitrate"
+    save_config
+  else
+    echo "$TXT_INVALID_CHOICE"
+    sleep 1
+  fi
+}
+
+change_resolution() {
+  read -rp "$TXT_ENTER_RESOLUTION" newRes
+  if [[ "$newRes" =~ ^[0-9]+$ ]]; then
+    RESOLUTION="$newRes"
+    save_config
+  else
+    echo "$TXT_INVALID_CHOICE"
+    sleep 1
+  fi
 }
 
 main_menu() {
-    while true; do
-        clear
-        echo "===== SCRCPY MENU ====="
-        echo "[D] Jalankan via USB"
-        echo "[E] Jalankan via Wi-Fi (input IP manual)"
-        echo "[A] Auto Detect Wi-Fi"
-        echo "[P] Ubah Port (sekarang: $PORT)"
-        echo "[B] Ubah Video Bitrate (sekarang: $BITRATE)"
-        echo "[R] Ubah Resolusi (sekarang: $RESOLUTION)"
-        echo "[Q] Keluar"
-        echo "======================="
-        read -p "Pilih menu: " choice
-        choice=$(echo "$choice" | tr '[:upper:]' '[:lower:]')
-        case "$choice" in
-            d)
-                run_scrcpy "usb"
-                ;;
-            e)
-                read -p "Masukkan IP perangkat: " IP
-                adb connect "$IP:$PORT"
-                run_scrcpy "wifi"
-                ;;
-            a)
-                auto_detect_wifi
-                ;;
-            p)
-                read -p "Masukkan port baru: " PORT
-                save_config
-                ;;
-            b)
-                read -p "Masukkan bitrate baru (contoh: 8M): " BITRATE
-                save_config
-                ;;
-            r)
-                read -p "Masukkan resolusi baru (contoh: 1024): " RESOLUTION
-                save_config
-                ;;
-            q)
-                echo "🚪 Keluar skrip..."
-                read -p "Tekan Enter untuk keluar..."
-                clear
-                exit 0
-                ;;
-            *)
-                echo "❌ Pilihan tidak valid!"
-                sleep 1
-                ;;
+  while true; do
+    clear
+    # Tampilkan menu dengan variabel dinamis untuk PORT, BITRATE, RESOLUTION
+    set_language "$LANG_SETTING"
+    # Replace placeholders di menu teks:
+    menu_port=${PORT}
+    menu_bitrate=${BITRATE}
+    menu_resolution=${RESOLUTION}
+
+    # Tampilkan menu dengan ganti placeholder {PORT}, {BITRATE}, {RESOLUTION}
+    echo "${TXT_MENU_TITLE}"
+    echo "${TXT_MENU_USB}"
+    echo "${TXT_MENU_WIFI}"
+    echo "${TXT_MENU_AUTO_WIFI}"
+    echo "${TXT_MENU_CHANGE_PORT//\{PORT\}/$menu_port}"
+    echo "${TXT_MENU_CHANGE_BITRATE//\{BITRATE\}/$menu_bitrate}"
+    echo "${TXT_MENU_CHANGE_RESOLUTION//\{RESOLUTION\}/$menu_resolution}"
+    echo "${TXT_MENU_CHANGE_LANG}"
+    echo "${TXT_MENU_QUIT}"
+    echo "======================="
+    read -rp "$TXT_CHOOSE_MENU" choice
+    choice=$(echo "$choice" | tr '[:upper:]' '[:lower:]')
+
+    case "$choice" in
+      d)
+        check_usb_devices
+        if [ ${#USB_DEVICES[@]} -eq 0 ]; then
+          echo "$TXT_USB_NO_DEVICE"
+          read -rp "$TXT_PRESS_ENTER"
+        else
+          if [ ${#USB_DEVICES[@]} -eq 1 ]; then
+            SELECTED_USB_DEVICE="${USB_DEVICES[0]}"
+          else
+            echo "$TXT_USB_FOUND_MULTIPLE"
+            for i in "${!USB_DEVICES[@]}"; do
+              echo "[$((i+1))] ${USB_DEVICES[i]}"
+            done
+            read -rp "$TXT_USB_CHOOSE" sel
+            if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#USB_DEVICES[@]} )); then
+              SELECTED_USB_DEVICE="${USB_DEVICES[$((sel-1))]}"
+            else
+              echo "$TXT_INVALID_CHOICE"
+              sleep 1
+              continue
+            fi
+          fi
+          run_scrcpy_usb
+        fi
+        ;;
+      e)
+        run_manual_wifi
+        ;;
+      a)
+        auto_detect_wifi
+        ;;
+      p)
+        change_port
+        ;;
+      b)
+        change_bitrate
+        ;;
+      r)
+        change_resolution
+        ;;
+      l)
+        read -rp "$TXT_ENTER_LANG" newLang
+        case "$newLang" in
+          id|en|auto) set_language "$newLang" ;;
+          *) echo "$TXT_INVALID_CHOICE"; sleep 1 ;;
         esac
-    done
+        ;;
+      q)
+        echo "$TXT_EXIT_MSG"
+        read -r
+        clear
+        exit 0
+        ;;
+      *)
+        echo "$TXT_INVALID_CHOICE"
+        sleep 1
+        ;;
+    esac
+  done
 }
 
-if ! auto_connect_usb; then
+# Program utama mulai di sini
+load_config
+
+if [[ "$LANG_SETTING" == "auto" ]]; then
+  set_language "auto"
+else
+  set_language "$LANG_SETTING"
+fi
+
+check_usb_devices
+
+if [ ${#USB_DEVICES[@]} -eq 1 ]; then
+  SELECTED_USB_DEVICE="${USB_DEVICES[0]}"
+  run_scrcpy_usb
+  main_menu
+elif [ ${#USB_DEVICES[@]} -gt 1 ]; then
+  echo "$TXT_USB_FOUND_MULTIPLE"
+  for i in "${!USB_DEVICES[@]}"; do
+    echo "[$((i+1))] ${USB_DEVICES[i]}"
+  done
+  read -rp "$TXT_USB_CHOOSE" sel
+  if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#USB_DEVICES[@]} )); then
+    SELECTED_USB_DEVICE="${USB_DEVICES[$((sel-1))]}"
+    run_scrcpy_usb
     main_menu
+  else
+    echo "$TXT_INVALID_CHOICE"
+    sleep 1
+    main_menu
+  fi
+else
+  main_menu
 fi
