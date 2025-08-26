@@ -1,9 +1,7 @@
 #!/bin/bash
 
-# source >> https://github.com/taufikmrf/ScrCpy-Launcher/blob/main/scrcpy.sh
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/scrcpy_config.conf"
+CONFIG_FILE="$SCRIPT_DIR/scrcpy.conf"
 LANG_DIR="$SCRIPT_DIR/language"
 
 LANG_SETTING="auto"
@@ -14,7 +12,7 @@ RESOLUTION=1024
 USB_DEVICES=()
 SELECTED_USB_DEVICE=""
 EXIT_REQUESTED=0
-SCRCPY_PID=0
+SCRCPY_PID=()
 
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
@@ -73,12 +71,15 @@ set_language() {
 }
 
 handle_ctrl_c() {
-  if (( SCRCPY_PID != 0 )); then
+  if (( ${#SCRCPY_PID[@]} > 0 )); then
     echo
     echo "$TXT_CTRL_C_DETECTED"
-    kill "$SCRCPY_PID" 2>/dev/null
-    wait "$SCRCPY_PID" 2>/dev/null
-    SCRCPY_PID=0
+    for i in "${!SCRCPY_PID[@]}"; do
+      echo "$TXT_CTRL_C_KILLING ${SCRCPY_PID[i]}..."
+      kill "${SCRCPY_PID[i]}" 2>/dev/null
+      wait "${SCRCPY_PID[i]}" 2>/dev/null
+    done
+    SCRCPY_PID=()
     EXIT_REQUESTED=0
     read -rp "$TXT_PRESS_ENTER"
     clear
@@ -111,11 +112,25 @@ check_usb_devices() {
 }
 
 run_scrcpy_usb() {
-  echo "${TXT_RUNNING_USB}${SELECTED_USB_DEVICE}..."
-  scrcpy --power-off-on-close -Sw -d --video-bit-rate "$BITRATE" --max-size "$RESOLUTION" &
-  SCRCPY_PID=$!
-  wait "$SCRCPY_PID"
-  SCRCPY_PID=0
+  if [[ "$SELECTED_USB_DEVICE" == "$TXT_USB_CHOOSE_ALL" ]]; then
+    echo "${TXT_RUNNING_USB} ${TXT_USB_CHOOSE_ALL}..."
+    for dev in "${USB_DEVICES[@]}"; do
+      echo "Menjalankan scrcpy pada $dev ..."
+      scrcpy --power-off-on-close -Sw -s "$dev" --video-bit-rate "$BITRATE" --max-size "$RESOLUTION" &
+      SCRCPY_PID+=($!)
+    done
+    # Tunggu semua proses scrcpy selesai
+    for pid in "${SCRCPY_PID[@]}"; do
+      wait "$pid"
+    done
+    SCRCPY_PID=()
+  else
+    echo "${TXT_RUNNING_USB}${SELECTED_USB_DEVICE}..."
+    scrcpy --power-off-on-close -Sw -s "$SELECTED_USB_DEVICE" --video-bit-rate "$BITRATE" --max-size "$RESOLUTION" &
+    SCRCPY_PID=($!)
+    wait "${SCRCPY_PID[0]}"
+    SCRCPY_PID=()
+  fi
 }
 
 run_scrcpy_wifi() {
@@ -124,9 +139,9 @@ run_scrcpy_wifi() {
   if adb connect "$ip:$PORT" | grep -iq "connected to"; then
     echo "${TXT_RUNNING_WIFI}${ip}:${PORT}..."
     scrcpy --power-off-on-close -Sw -e --video-bit-rate "$BITRATE" --max-size "$RESOLUTION" &
-    SCRCPY_PID=$!
-    wait "$SCRCPY_PID"
-    SCRCPY_PID=0
+    SCRCPY_PID=($!)
+    wait "${SCRCPY_PID[0]}"
+    SCRCPY_PID=()
   else
     echo "${TXT_FAILED_CONNECT_IP}${ip}:$PORT"
     read -rp "$TXT_PRESS_ENTER"
@@ -179,10 +194,6 @@ auto_detect_wifi() {
     adb tcpip "$PORT"
     sleep 2
     echo "$TXT_USB_RELEASE_USB"
-  else
-    echo "$TXT_USB_NO_DEVICE"
-    read -rp "$TXT_PRESS_ENTER"
-    return
   fi
 
   local_ip=$(ipconfig getifaddr en0)
@@ -195,6 +206,7 @@ auto_detect_wifi() {
   subnet=$(echo "$local_ip" | awk -F. '{print $1"."$2"."$3".0/24"}')
 
   echo "${TXT_SCAN_NETWORK}${subnet}..."
+  echo
 
   if ! command -v nmap &> /dev/null; then
     echo "$TXT_NMAP_NOT_FOUND"
@@ -202,7 +214,33 @@ auto_detect_wifi() {
     return
   fi
 
-  mapfile -t open_ips < <(nmap -p "$PORT" --open -T4 "$subnet" -oG - | grep "Ports: $PORT/open" | awk '{print $2}')
+  open_ips=()
+  if command -v timeout &> /dev/null; then
+    while IFS= read -r ip; do
+      open_ips+=("$ip")
+    done < <(timeout 60 nmap -p "$PORT" --open -T4 "$subnet" -oG - | grep "Ports: $PORT/open" | awk '{print $2}')
+  elif command -v gtimeout &> /dev/null; then
+    while IFS= read -r ip; do
+      open_ips+=("$ip")
+    done < <(gtimeout 60 nmap -p "$PORT" --open -T4 "$subnet" -oG - | grep "Ports: $PORT/open" | awk '{print $2}')
+  else
+    # Jalankan nmap di background ke tmpfile
+    tmpfile=$(mktemp)
+    nmap -p "$PORT" --open -T4 "$subnet" -oG - > "$tmpfile" 2>/dev/null &
+    nmap_pid=$!
+
+    # Tunggu nmap selesai jika belum selesai
+    wait "$nmap_pid" 2>/dev/null
+
+    # Ambil IP dari tmpfile
+    open_ips=()
+    while IFS= read -r ip; do
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            open_ips+=("$ip")
+        fi
+    done < <(grep "Ports: $PORT/open" "$tmpfile" | awk '{print $2}')
+    rm -f "$tmpfile"
+  fi
 
   if [ ${#open_ips[@]} -eq 0 ]; then
     echo "${TXT_NOT_FOUND_WIFI}${PORT}."
@@ -296,13 +334,17 @@ main_menu() {
           if [ ${#USB_DEVICES[@]} -eq 1 ]; then
             SELECTED_USB_DEVICE="${USB_DEVICES[0]}"
           else
+            count_plus_one=$(( ${#USB_DEVICES[@]} + 1 ))
             echo "$TXT_USB_FOUND_MULTIPLE"
             for i in "${!USB_DEVICES[@]}"; do
               echo "[$((i+1))] ${USB_DEVICES[i]}"
             done
+            echo "[$count_plus_one] $TXT_USB_CHOOSE_ALL"
             read -rp "$TXT_USB_CHOOSE" sel
             if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#USB_DEVICES[@]} )); then
               SELECTED_USB_DEVICE="${USB_DEVICES[$((sel-1))]}"
+            elif [[ "$sel" -eq $count_plus_one ]]; then
+              SELECTED_USB_DEVICE=$TXT_USB_CHOOSE_ALL
             else
               echo "$TXT_INVALID_CHOICE"
               sleep 1
@@ -364,13 +406,19 @@ if [ ${#USB_DEVICES[@]} -eq 1 ]; then
   run_scrcpy_usb
   main_menu
 elif [ ${#USB_DEVICES[@]} -gt 1 ]; then
+  count_plus_one=$(( ${#USB_DEVICES[@]} + 1 ))
   echo "$TXT_USB_FOUND_MULTIPLE"
   for i in "${!USB_DEVICES[@]}"; do
     echo "[$((i+1))] ${USB_DEVICES[i]}"
   done
+  echo "[$count_plus_one] $TXT_USB_CHOOSE_ALL"
   read -rp "$TXT_USB_CHOOSE" sel
   if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#USB_DEVICES[@]} )); then
     SELECTED_USB_DEVICE="${USB_DEVICES[$((sel-1))]}"
+    run_scrcpy_usb
+    main_menu
+  elif [[ "$sel" -eq $count_plus_one ]]; then
+    SELECTED_USB_DEVICE=$TXT_USB_CHOOSE_ALL
     run_scrcpy_usb
     main_menu
   else
